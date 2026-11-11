@@ -1,0 +1,20 @@
+{
+  "title": "OpenUI",
+  "pages": [
+    "index",
+    "getting-started",
+    "openui-lang",
+    "build-agents",
+    "dashboards",
+    "agent",
+    "cookbooks",
+    "integrations",
+    "demos",
+    "production",
+    "gateway",
+    "autofix",
+    "reliability",
+    "deploy",
+    "api-reference"
+  ]
+}
