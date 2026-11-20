@@ -1,0 +1,406 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
+
+vi.mock('@clack/prompts', () => {
+  const noop = () => {};
+  return {
+    intro: noop,
+    outro: noop,
+    note: noop,
+    confirm: vi.fn().mockResolvedValue(true),
+    isCancel: () => false,
+    cancel: noop,
+    log: {
+      info: vi.fn(),
+      message: vi.fn(),
+      warn: noop,
+      error: vi.fn(),
+      step: noop,
+      success: noop,
+    },
+    spinner: () => ({ start: noop, stop: noop }),
+  };
+});
+
+vi.mock('picocolors', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('picocolors')>();
+  const plain = actual.createColors(false);
+  return { ...actual, default: plain, createColors: () => plain };
+});
+
+vi.mock('../src/telemetry.ts', () => ({
+  track: vi.fn(),
+  setVersion: vi.fn(),
+  fetchAuditData: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../src/detect-agent.ts', () => ({
+  detectAgent: vi.fn().mockResolvedValue({ isAgent: false, agent: { name: 'none' } }),
+  getAgentType: vi.fn(),
+  ensureUniversalAgents: vi.fn((agents: string[]) => agents),
+}));
+
+vi.mock('../src/prompts/search-multiselect.ts', () => ({
+  searchMultiselect: vi.fn(async ({ items }) =>
+    items
+      .filter((item: { label: string }) => item.label === 'healthy')
+      .map((item: { value: unknown }) => item.value)
+  ),
+}));
+
+vi.mock('../src/source-parser.ts', async (importActual) => {
+  const actual = await importActual<typeof import('../src/source-parser.ts')>();
+  return {
+    ...actual,
+    isRepoPrivate: vi.fn().mockResolvedValue(false),
+    lookupGitHubRepo: vi.fn().mockResolvedValue({ private: false, fullName: null }),
+  };
+});
+
+import { runAdd } from '../src/add.ts';
+import { track } from '../src/telemetry.ts';
+import { searchMultiselect } from '../src/prompts/search-multiselect.ts';
+import * as p from '@clack/prompts';
+
+const DISCOVERY_SCHEMA_V2 = 'https://schemas.agentskills.io/discovery/0.2.0/schema.json';
+
+function mockLegacyPack({ internal = false } = {}) {
+  const installUrl = 'https://registry.example.com/p/example-pack';
+  const baseUrl = `${installUrl}/.well-known/agent-skills`;
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+    const href = String(url);
+    if (href === `${baseUrl}/index.json`) {
+      return Response.json({
+        skills: [
+          { name: 'healthy', description: 'Healthy skill.', files: ['SKILL.md', 'reference.txt'] },
+          {
+            name: 'incomplete',
+            description: 'Incomplete skill.',
+            files: ['SKILL.md', 'references/README.md'],
+          },
+        ],
+      });
+    }
+    if (href === `${baseUrl}/healthy/SKILL.md`) {
+      return new Response('---\nname: Friendly Skill\ndescription: Healthy skill.\n---\n# Healthy');
+    }
+    if (href === `${baseUrl}/healthy/reference.txt`) {
+      return new Response('Healthy reference');
+    }
+    if (href === `${baseUrl}/incomplete/SKILL.md`) {
+      return new Response(
+        `---\nname: incomplete\ndescription: Incomplete skill.\n${internal ? 'metadata:\n  internal: true\n' : ''}---\n# Incomplete`
+      );
+    }
+    if (href === `${baseUrl}/incomplete/references/README.md`) {
+      return new Response('rate limited', { status: 429 });
+    }
+    return new Response('not found', { status: 404 });
+  });
+  return { installUrl, baseUrl, fetchSpy };
+}
+
+function createTarGz(files: Record<string, string>): Uint8Array {
+  const chunks: Buffer[] = [];
+
+  for (const [name, contents] of Object.entries(files)) {
+    const body = Buffer.from(contents);
+    const header = Buffer.alloc(512);
+    header.write(name, 0, 100, 'utf8');
+    header.write('0000644\0', 100, 8, 'ascii');
+    header.write('0000000\0', 108, 8, 'ascii');
+    header.write('0000000\0', 116, 8, 'ascii');
+    header.write(body.length.toString(8).padStart(11, '0') + '\0', 124, 12, 'ascii');
+    header.write('00000000000\0', 136, 12, 'ascii');
+    header.fill(' ', 148, 156);
+    header[156] = '0'.charCodeAt(0);
+    header.write('ustar\0', 257, 6, 'ascii');
+    header.write('00', 263, 2, 'ascii');
+
+    let checksum = 0;
+    for (const byte of header) checksum += byte;
+    header.write(checksum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
+
+    chunks.push(header, body);
+    const padding = (512 - (body.length % 512)) % 512;
+    if (padding) chunks.push(Buffer.alloc(padding));
+  }
+
+  chunks.push(Buffer.alloc(1024));
+  return new Uint8Array(gzipSync(Buffer.concat(chunks)));
+}
+
+describe('direct download add', () => {
+  let project: string;
+  let originalCwd: string;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    project = await mkdtemp(join(tmpdir(), 'direct-download-add-'));
+    originalCwd = process.cwd();
+    process.chdir(project);
+    vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+  });
+
+  afterEach(async () => {
+    process.chdir(originalCwd);
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    await rm(project, { recursive: true, force: true });
+  });
+
+  it('installs a signed direct URL without persisting it for updates', async () => {
+    const directUrl = 'https://downloads.example.com/artifacts/direct-skill?x-amz-signature=secret';
+    const skillMd = '---\nname: direct-skill\ndescription: Direct skill\n---\n\n# Direct skill\n';
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      if (String(url) === directUrl) {
+        return new Response(skillMd, {
+          status: 200,
+          headers: { 'content-length': String(Buffer.byteLength(skillMd)) },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    await runAdd([directUrl], {
+      yes: true,
+      agent: ['codex'],
+      global: false,
+      copy: true,
+    });
+
+    await expect(
+      readFile(join(project, '.agents', 'skills', 'direct-skill', 'SKILL.md'), 'utf-8')
+    ).resolves.toContain('# Direct skill');
+    expect(existsSync(join(project, 'skills-lock.json'))).toBe(false);
+  });
+
+  it('stops before installing or falling back when a pack file cannot be downloaded', async () => {
+    const { installUrl, fetchSpy } = mockLegacyPack();
+
+    await expect(
+      runAdd([installUrl], { yes: true, agent: ['codex'], global: false, copy: true })
+    ).rejects.toThrow('process.exit called');
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(p.log.error).toHaveBeenCalledWith(
+      expect.stringContaining('references/README.md" for skill "incomplete" (HTTP 429)')
+    );
+    expect(existsSync(join(project, '.agents', 'skills'))).toBe(false);
+    expect(existsSync(join(project, 'skills-lock.json'))).toBe(false);
+    expect(fetchSpy.mock.calls.some(([url]) => String(url) === installUrl)).toBe(false);
+    expect(track).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'install' }));
+  });
+
+  it.each(['healthy', 'FRIENDLY SKILL'])(
+    'installs the selected skill %s without downloading an unselected broken skill',
+    async (selector) => {
+      const { installUrl, baseUrl, fetchSpy } = mockLegacyPack();
+
+      await runAdd([installUrl], {
+        yes: true,
+        agent: ['codex'],
+        global: false,
+        copy: true,
+        skill: [selector],
+      });
+
+      await expect(
+        readFile(join(project, '.agents', 'skills', 'healthy', 'reference.txt'), 'utf-8')
+      ).resolves.toBe('Healthy reference');
+      expect(existsSync(join(project, '.agents', 'skills', 'incomplete'))).toBe(false);
+      expect(
+        fetchSpy.mock.calls.some(
+          ([url]) => String(url) === `${baseUrl}/incomplete/references/README.md`
+        )
+      ).toBe(false);
+      expect(process.exit).not.toHaveBeenCalled();
+    }
+  );
+
+  it('installs public skills without downloading a hidden internal skill', async () => {
+    vi.stubEnv('INSTALL_INTERNAL_SKILLS', '');
+    const { installUrl, baseUrl, fetchSpy } = mockLegacyPack({ internal: true });
+
+    await runAdd([installUrl], { yes: true, agent: ['codex'], global: false, copy: true });
+
+    await expect(
+      readFile(join(project, '.agents', 'skills', 'healthy', 'reference.txt'), 'utf-8')
+    ).resolves.toBe('Healthy reference');
+    expect(existsSync(join(project, '.agents', 'skills', 'incomplete'))).toBe(false);
+    expect(
+      fetchSpy.mock.calls.some(
+        ([url]) => String(url) === `${baseUrl}/incomplete/references/README.md`
+      )
+    ).toBe(false);
+  });
+
+  it('lets an interactive selection skip a broken skill', async () => {
+    const { installUrl, baseUrl, fetchSpy } = mockLegacyPack();
+
+    await runAdd([installUrl], { agent: ['codex'], global: false, copy: true });
+
+    expect(searchMultiselect).toHaveBeenCalled();
+    await expect(
+      readFile(join(project, '.agents', 'skills', 'healthy', 'reference.txt'), 'utf-8')
+    ).resolves.toBe('Healthy reference');
+    expect(
+      fetchSpy.mock.calls.some(
+        ([url]) => String(url) === `${baseUrl}/incomplete/references/README.md`
+      )
+    ).toBe(false);
+  });
+
+  it('lists all discovered skills without downloading their supporting files', async () => {
+    const { installUrl, fetchSpy } = mockLegacyPack();
+
+    await expect(runAdd([installUrl], { list: true, skill: ['healthy'] })).rejects.toThrow(
+      'process.exit called'
+    );
+
+    expect(process.exit).toHaveBeenNthCalledWith(1, 0);
+    expect(p.log.message).toHaveBeenCalledWith('  healthy');
+    expect(p.log.message).toHaveBeenCalledWith('  incomplete');
+    expect(fetchSpy.mock.calls.every(([url]) => /\/(index.json|SKILL.md)$/.test(String(url)))).toBe(
+      true
+    );
+    expect(existsSync(join(project, '.agents', 'skills'))).toBe(false);
+  });
+
+  it('reports an unmatched selector without downloading files or falling back', async () => {
+    const { installUrl, fetchSpy } = mockLegacyPack();
+
+    await expect(
+      runAdd([installUrl], { yes: true, skill: ['missing'], agent: ['codex'] })
+    ).rejects.toThrow('process.exit called');
+
+    expect(p.log.error).toHaveBeenCalledWith(
+      expect.stringContaining('No matching skills found for: missing')
+    );
+    expect(p.log.error).toHaveBeenCalledWith(expect.stringContaining('Available skills:'));
+    expect(fetchSpy.mock.calls.every(([url]) => /\/(index.json|SKILL.md)$/.test(String(url)))).toBe(
+      true
+    );
+    expect(existsSync(join(project, 'skills-lock.json'))).toBe(false);
+  });
+
+  it('reports the canonical discovery url separately from its archive artifact', async () => {
+    const installUrl = 'https://registry.example.com/publishers/acme/skills/archive-skill';
+    const indexUrl = `${installUrl}/.well-known/agent-skills/index.json`;
+    const artifactUrl = 'https://cdn.example.net/artifacts/archive-skill.tar.gz?version=1.2.5';
+    const skillMd =
+      '---\nname: archive-skill\ndescription: Archive skill\n---\n\n# Archive skill\n';
+    const archive = createTarGz({ 'SKILL.md': skillMd });
+    const digest = `sha256:${createHash('sha256').update(archive).digest('hex')}`;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      const href = String(url);
+      if (href === indexUrl) {
+        return Response.json({
+          $schema: DISCOVERY_SCHEMA_V2,
+          skills: [
+            {
+              name: 'archive-skill',
+              type: 'archive',
+              description: 'Archive skill',
+              url: artifactUrl,
+              digest,
+            },
+          ],
+        });
+      }
+      if (href === artifactUrl) {
+        return new Response(archive, {
+          status: 200,
+          headers: { 'content-type': 'application/gzip' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    await runAdd([installUrl], {
+      yes: true,
+      agent: ['codex'],
+      global: false,
+      copy: true,
+    });
+
+    expect(track).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'install',
+        source: 'registry.example.com',
+        installUrl,
+        skillFiles: JSON.stringify({ 'archive-skill': artifactUrl }),
+        sourceType: 'well-known',
+      })
+    );
+  });
+
+  describe('a well-known skill whose lock cannot be written', () => {
+    const installUrl = 'https://registry.example.com/skills/locked-skill';
+    const artifactUrl = 'https://cdn.example.net/locked-skill.tar.gz';
+    let readOnlyLock: string;
+
+    beforeEach(() => {
+      const archive = createTarGz({
+        'SKILL.md': '---\nname: locked-skill\ndescription: Locked skill\n---\n',
+      });
+      const digest = `sha256:${createHash('sha256').update(archive).digest('hex')}`;
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+        const href = String(url);
+        if (href === `${installUrl}/.well-known/agent-skills/index.json`) {
+          return Response.json({
+            $schema: DISCOVERY_SCHEMA_V2,
+            skills: [
+              { name: 'locked-skill', type: 'archive', description: 'x', url: artifactUrl, digest },
+            ],
+          });
+        }
+        if (href === artifactUrl) return new Response(archive, { status: 200 });
+        return new Response('not found', { status: 404 });
+      });
+      process.exitCode = undefined;
+    });
+
+    afterEach(() => {
+      chmodSync(readOnlyLock, 0o644);
+      process.exitCode = undefined;
+      vi.unstubAllEnvs();
+    });
+
+    function makeReadOnlyLock(path: string, version: number): void {
+      writeFileSync(path, JSON.stringify({ version, skills: {} }));
+      chmodSync(path, 0o444);
+      readOnlyLock = path;
+    }
+
+    it('exits 1 for a project install', async () => {
+      makeReadOnlyLock(join(project, 'skills-lock.json'), 1);
+
+      await runAdd([installUrl], { yes: true, agent: ['codex'], global: false, copy: true });
+
+      expect(existsSync(join(project, '.agents', 'skills', 'locked-skill', 'SKILL.md'))).toBe(true);
+      expect(process.exitCode).toBe(1);
+    });
+
+    it('exits 1 for a global install', async () => {
+      vi.stubEnv('HOME', project);
+      vi.stubEnv('USERPROFILE', project);
+      vi.stubEnv('XDG_STATE_HOME', join(project, 'state'));
+      mkdirSync(join(project, 'state', 'skills'), { recursive: true });
+      makeReadOnlyLock(join(project, 'state', 'skills', '.skill-lock.json'), 3);
+
+      await runAdd([installUrl], { yes: true, agent: ['codex'], global: true, copy: true });
+
+      expect(process.exitCode).toBe(1);
+    });
+  });
+});

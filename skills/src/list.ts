@@ -1,0 +1,327 @@
+import { homedir } from 'os';
+import type { AgentType } from './types.ts';
+import { agents } from './agents.ts';
+import { diagnostics, formatError } from './diagnostics.ts';
+import { parseCliArgs, throwFirstError } from './cli-args.ts';
+import { listInstalledSkills, sanitizeName, type InstalledSkill } from './installer.ts';
+import { sanitizeMetadata } from './sanitize.ts';
+import { getAllLockedSkills } from './skill-lock.ts';
+import { getLockedSkillState, readLocalLock } from './local-lock.ts';
+import { BOLD, CYAN, DIM, RESET, YELLOW } from './color.ts';
+
+interface ListOptions {
+  global?: boolean;
+  agent?: string[];
+  json?: boolean;
+}
+
+interface ListLockEntry {
+  source: string;
+  sourceUrl?: string;
+  sourceType: string;
+  pluginName?: string;
+  /** Project lock only; lets `list` tell a modified skill from a tracked one. */
+  computedHash?: string;
+  skillName?: string;
+}
+
+/** ` (renamed from <name>)` for a skill installed under another name, else empty. */
+function renamedLabel(entry: ListLockEntry | undefined): string {
+  return entry?.skillName
+    ? ` ${DIM}(renamed from ${sanitizeMetadata(entry.skillName)})${RESET}`
+    : '';
+}
+
+/**
+ * Shortens a path for display: replaces homedir with ~ and cwd with .
+ */
+function shortenPath(fullPath: string, cwd: string): string {
+  const home = homedir();
+  if (fullPath.startsWith(home)) {
+    return fullPath.replace(home, '~');
+  }
+  if (fullPath.startsWith(cwd)) {
+    return '.' + fullPath.slice(cwd.length);
+  }
+  return fullPath;
+}
+
+/**
+ * Formats a list of items, truncating if too many
+ */
+function formatList(items: string[], maxShow: number = 5): string {
+  if (items.length <= maxShow) {
+    return items.join(', ');
+  }
+  const shown = items.slice(0, maxShow);
+  const remaining = items.length - maxShow;
+  return `${shown.join(', ')} +${remaining} more`;
+}
+
+export function parseListOptions(args: string[]): ListOptions {
+  const { values, errors } = parseCliArgs(args, {
+    global: { type: 'boolean', short: 'g' },
+    json: { type: 'boolean' },
+    agent: { type: 'list', short: 'a', value: 'an agent name' },
+  });
+  throwFirstError(errors);
+  return { global: values.global, json: values.json, agent: values.agent };
+}
+
+/** Listing is read-only, so an unusable lock only costs source info. */
+async function readProjectLockOrWarn(cwd: string): Promise<Record<string, ListLockEntry>> {
+  try {
+    return (await readLocalLock(cwd)).skills;
+  } catch (error) {
+    if (!diagnostics.SKILLS_INVALID_LOCAL_LOCK.is(error)) throw error;
+    console.error(`${YELLOW}Warning: ${formatError(error)}${RESET}`);
+    return {};
+  }
+}
+
+export async function runList(args: string[]): Promise<void> {
+  const options = parseListOptions(args);
+
+  // Default to project only (local), use -g for global
+  const scope = options.global === true ? true : false;
+
+  // Validate agent filter if provided
+  let agentFilter: AgentType[] | undefined;
+  if (options.agent && options.agent.length > 0) {
+    const validAgents = Object.keys(agents);
+    const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
+
+    if (invalidAgents.length > 0) {
+      console.log(
+        formatError(
+          diagnostics.SKILLS_INVALID_AGENTS({ invalid: invalidAgents, valid: validAgents })
+        )
+      );
+      process.exit(1);
+    }
+
+    agentFilter = options.agent as AgentType[];
+  }
+
+  const installedSkills = await listInstalledSkills({
+    global: scope,
+    agentFilter,
+  });
+
+  const cwd = process.cwd();
+  // Fetch lock entries to get source and plugin grouping info for the selected scope.
+  const lockedSkills: Record<string, ListLockEntry> = scope
+    ? await getAllLockedSkills()
+    : await readProjectLockOrWarn(cwd);
+  const lockEntriesBySanitizedName = new Map(
+    Object.entries(lockedSkills).map(([name, entry]) => [sanitizeName(name), entry])
+  );
+  const getLockEntry = (skillName: string): ListLockEntry | undefined =>
+    lockedSkills[skillName] ?? lockEntriesBySanitizedName.get(sanitizeName(skillName));
+
+  // An agent filter hides skills that are on disk, so only an unfiltered listing can tell
+  // that a locked skill is missing.
+  const installedNames = new Set(installedSkills.map((skill) => sanitizeName(skill.name)));
+  const missingSkills = agentFilter
+    ? []
+    : Object.entries(lockedSkills).filter(([name]) => !installedNames.has(sanitizeName(name)));
+
+  // Project skills whose files no longer hash to their lock entry
+  const modifiedNames = new Set<string>();
+  if (!scope) {
+    await Promise.all(
+      installedSkills.map(async (skill) => {
+        const lockEntry = getLockEntry(skill.name);
+        if (lockEntry?.computedHash === undefined) return;
+        const state = await getLockedSkillState(
+          skill.name,
+          { computedHash: lockEntry.computedHash },
+          cwd,
+          skill.canonicalPath
+        );
+        if (state === 'modified') modifiedNames.add(skill.name);
+      })
+    );
+  }
+  const statusOf = (skill: InstalledSkill): 'tracked' | 'untracked' | 'modified' =>
+    !getLockEntry(skill.name)
+      ? 'untracked'
+      : modifiedNames.has(skill.name)
+        ? 'modified'
+        : 'tracked';
+
+  // JSON output mode: structured, no ANSI, untruncated agent lists
+  if (options.json) {
+    const jsonOutput = installedSkills.map((skill) => {
+      const lockEntry = getLockEntry(skill.name);
+      return {
+        name: skill.name,
+        path: skill.canonicalPath,
+        scope: skill.scope,
+        agents: skill.agents.map((a) => agents[a].displayName),
+        source: lockEntry?.source ?? null,
+        sourceUrl: lockEntry?.sourceUrl ?? null,
+        sourceType: lockEntry?.sourceType ?? null,
+        renamedFrom: lockEntry?.skillName ?? null,
+        status: statusOf(skill),
+      };
+    });
+    const missingOutput = missingSkills.map(([name, lockEntry]) => ({
+      name,
+      path: null,
+      scope: scope ? 'global' : 'project',
+      agents: [],
+      source: lockEntry.source,
+      sourceUrl: lockEntry.sourceUrl ?? null,
+      sourceType: lockEntry.sourceType,
+      renamedFrom: lockEntry.skillName ?? null,
+      status: 'missing',
+    }));
+    console.log(JSON.stringify([...jsonOutput, ...missingOutput], null, 2));
+    return;
+  }
+
+  const scopeLabel = scope ? 'Global' : 'Project';
+
+  if (installedSkills.length === 0 && missingSkills.length === 0) {
+    if (options.json) {
+      console.log('[]');
+      return;
+    }
+    console.log(`${DIM}No ${scopeLabel.toLowerCase()} skills found.${RESET}`);
+    if (scope) {
+      console.log(`${DIM}Try listing project skills without -g${RESET}`);
+    } else {
+      console.log(`${DIM}Try listing global skills with -g${RESET}`);
+    }
+    return;
+  }
+
+  function printSkill(
+    skill: InstalledSkill,
+    indent: boolean = false,
+    maxNameLength: number = 0,
+    maxPathLength: number = 0
+  ): void {
+    const prefix = indent ? '  ' : '';
+    const shortPath = shortenPath(skill.canonicalPath, cwd);
+    const agentNames = skill.agents.map((a) => agents[a].displayName);
+    const agentInfo =
+      skill.agents.length > 0 ? formatList(agentNames) : `${YELLOW}not linked${RESET}`;
+
+    // Pad skill name and path for alignment
+    const paddedName = sanitizeMetadata(skill.name).padEnd(maxNameLength);
+    const paddedPath = shortPath.padEnd(maxPathLength);
+
+    // Determine source from lock file
+    const lockEntry = getLockEntry(skill.name);
+    const source = lockEntry?.source ?? null;
+    const sourceLabel = source
+      ? sanitizeMetadata(source) + renamedLabel(lockEntry)
+      : `${YELLOW}untracked${RESET}`;
+    const modifiedLabel =
+      statusOf(skill) === 'modified'
+        ? `  ${YELLOW}modified${RESET} ${DIM}(differs from the lock)${RESET}`
+        : '';
+
+    console.log(`${prefix}${CYAN}${paddedName}${RESET} ${DIM}${paddedPath}${RESET}`);
+    console.log(
+      `${prefix}  ${DIM}Agents:${RESET} ${agentInfo}  ${DIM}Source:${RESET} ${sourceLabel}${modifiedLabel}`
+    );
+  }
+
+  console.log(`${BOLD}${scopeLabel} Skills${RESET}`);
+  console.log();
+
+  // Group skills by plugin
+  const groupedSkills: Record<string, InstalledSkill[]> = {};
+  const ungroupedSkills: InstalledSkill[] = [];
+
+  for (const skill of installedSkills) {
+    const lockEntry = getLockEntry(skill.name);
+    if (lockEntry?.pluginName) {
+      const group = lockEntry.pluginName;
+      if (!groupedSkills[group]) {
+        groupedSkills[group] = [];
+      }
+      groupedSkills[group].push(skill);
+    } else {
+      ungroupedSkills.push(skill);
+    }
+  }
+
+  const hasGroups = Object.keys(groupedSkills).length > 0;
+
+  if (hasGroups) {
+    // Print groups sorted alphabetically
+    const sortedGroups = Object.keys(groupedSkills).sort();
+    for (const group of sortedGroups) {
+      // Convert kebab-case to Title Case for display header
+      const title = group
+        .split('-')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      console.log(`${BOLD}${title}${RESET}`);
+      const skills = groupedSkills[group];
+      if (skills) {
+        // Calculate max lengths for alignment within this group
+        let maxNameLength = 0;
+        let maxPathLength = 0;
+        for (const skill of skills) {
+          const nameLength = sanitizeMetadata(skill.name).length;
+          const pathLength = shortenPath(skill.canonicalPath, cwd).length;
+          if (nameLength > maxNameLength) maxNameLength = nameLength;
+          if (pathLength > maxPathLength) maxPathLength = pathLength;
+        }
+        for (const skill of skills) {
+          printSkill(skill, true, maxNameLength, maxPathLength);
+        }
+      }
+      console.log();
+    }
+
+    // Print ungrouped skills if any exist
+    if (ungroupedSkills.length > 0) {
+      console.log(`${BOLD}General${RESET}`);
+      // Calculate max lengths for alignment within ungrouped skills
+      let maxNameLength = 0;
+      let maxPathLength = 0;
+      for (const skill of ungroupedSkills) {
+        const nameLength = sanitizeMetadata(skill.name).length;
+        const pathLength = shortenPath(skill.canonicalPath, cwd).length;
+        if (nameLength > maxNameLength) maxNameLength = nameLength;
+        if (pathLength > maxPathLength) maxPathLength = pathLength;
+      }
+      for (const skill of ungroupedSkills) {
+        printSkill(skill, true, maxNameLength, maxPathLength);
+      }
+      console.log();
+    }
+  } else {
+    // No groups, print flat list as before
+    // Calculate max lengths for alignment in flat list
+    let maxNameLength = 0;
+    let maxPathLength = 0;
+    for (const skill of installedSkills) {
+      const nameLength = sanitizeMetadata(skill.name).length;
+      const pathLength = shortenPath(skill.canonicalPath, cwd).length;
+      if (nameLength > maxNameLength) maxNameLength = nameLength;
+      if (pathLength > maxPathLength) maxPathLength = pathLength;
+    }
+    for (const skill of installedSkills) {
+      printSkill(skill, false, maxNameLength, maxPathLength);
+    }
+    console.log();
+  }
+
+  if (missingSkills.length > 0) {
+    console.log(`${BOLD}Missing${RESET} ${DIM}(in the lock file, not on disk)${RESET}`);
+    for (const [name, entry] of missingSkills) {
+      console.log(
+        `  ${CYAN}${sanitizeMetadata(name)}${RESET}  ${DIM}Source:${RESET} ${sanitizeMetadata(entry.source)}${renamedLabel(entry)}`
+      );
+    }
+    console.log();
+  }
+}
